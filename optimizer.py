@@ -72,12 +72,12 @@ def evaluate_candidate(prices, max_charge_price, avg_15min_energy_wh, current_so
     )
 
     usable_existing_energy = max(
-        (current_soc / 100 - MIN_SOC) * BATTERY_CAPACITY,
+        (current_soc - MIN_SOC) / 100 * BATTERY_CAPACITY,
         0,
     )
 
     remaining_capacity = (
-        (1 - MIN_SOC) * BATTERY_CAPACITY
+        (100 - MIN_SOC) / 100 * BATTERY_CAPACITY
         - usable_existing_energy
     )
 

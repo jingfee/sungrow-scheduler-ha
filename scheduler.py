@@ -10,9 +10,6 @@ from constants import (
     BATTERY_CAPACITY,
     AVG_ENERGY_HOURS,
     MAX_CHARGE_POWER,
-    STANDARD_DEVIATION_THRESHOLD,
-    MIN_CHARGE_QUARTERS,
-    MAX_CHARGE_QUARTERS
 )
 from battery_commands import (
     set_start_charge,
@@ -21,6 +18,7 @@ from battery_commands import (
     set_stop_discharge
 )
 from optimizer import select_night_plan
+from forecast import get_forecast
 
 SCHEDULE_FILE = Path("/conf/apps/sungrow/schedules.json")
 
@@ -66,8 +64,27 @@ class SungrowScheduler(hass.Hass):
         self.current_soc = float(self.get_state("sensor.battery_level"))
         prices = self.get_prices()
         
-        if is_summer():
-            self.log("Is Summer")
+        if self.is_summer():
+            now = datetime.now(self.tz)
+            tomorrow = now + timedelta(days=1)
+            default_end = tomorrow.replace(hour=18, minute=0, second=0, microsecond=0)
+            latest_end = tomorrow.replace(hour=20, minute=0, second=0, microsecond=0)
+            forecast_start, forecast_end = get_forecast(self)
+            candidate_end = forecast_end or default_end
+            end_time = min(candidate_end, latest_end)
+            #run discharge_after_solar at end_time
+
+            self.discharge_schedule = []
+            if forecast_end is not None:
+                discharge_start = forecast_end + timedelta(hours=-2)
+                discharge_end = forecast_end + timedelta(minutes=-1)
+                discharge_obj = {"start": discharge_start, "end": discharge_end}
+                self.discharge_schedule.append(discharge_obj)
+                self.handles["discharge"].append(self.run_at(self.start_discharge, discharge_start, discharge_quarter=discharge_obj, unranked=True))
+
+            schedules = {"charge": [], "discharge": self.discharge_schedule}
+            with SCHEDULE_FILE.open("w") as f:
+                json.dump(schedules, f)
         else:
             charge_quarters, discharge_quarters = select_night_plan(prices, self.get_avg_15min_energy(), self.current_soc)
             if self.current_soc > 40 and not discharge_quarters:
@@ -83,7 +100,8 @@ class SungrowScheduler(hass.Hass):
                     self.run_at(
                         self.start_discharge,
                         datetime.fromisoformat(q["start"]),
-                        discharge_quarter=q
+                        discharge_quarter=q,
+                        unranked=False
                     )
                 )
             
@@ -104,7 +122,7 @@ class SungrowScheduler(hass.Hass):
             return
         self.price_fetch_retries = 0
 
-        charge_quarters, discharge_quarters = select_night_plan(prices, self.get_avg_15min_energy(), MIN_SOC * 100)
+        charge_quarters, discharge_quarters = select_night_plan(prices, self.get_avg_15min_energy(), MIN_SOC)
         if not charge_quarters:
             return
         
@@ -123,7 +141,8 @@ class SungrowScheduler(hass.Hass):
                 self.run_at(
                     self.start_discharge,
                     datetime.fromisoformat(q["start"]),
-                    discharge_quarter=q
+                    discharge_quarter=q,
+                    unranked=False
                 )
             )
         
@@ -147,10 +166,19 @@ class SungrowScheduler(hass.Hass):
                 areas="SE3",
                 currency="SEK"
             )
-            
-            day_prices = result["result"]["response"]["SE3"]
 
-            if not day_prices or len(day_prices) != 96:
+            day_prices = (
+                result
+                .get("result", {})
+                .get("response", {})
+                .get("SE3")
+            )
+
+            if day_prices is None:
+                self.log("SE3 prices not available yet")
+                continue
+
+            if len(day_prices) != 96:
                 self.error(f"Invalid price data for {dt}: {day_prices}")
                 continue
     
@@ -245,7 +273,7 @@ class SungrowScheduler(hass.Hass):
             self.log(f"Avg 15min energy: {avg_15min_energy}")
             total_energy = avg_15min_energy * discharge_quarters
             self.log(f"Total energy: {total_energy}")
-            target_soc = min(math.ceil(((BATTERY_CAPACITY * MIN_SOC + total_energy)/BATTERY_CAPACITY) * 100), 100)
+            target_soc = min(math.ceil(((BATTERY_CAPACITY * (MIN_SOC / 100) + total_energy)/BATTERY_CAPACITY) * 100), 100)
             self.log(f"Target soc: {target_soc}")
             
             if target_soc >= 100:
@@ -321,9 +349,9 @@ class SungrowScheduler(hass.Hass):
                 continue
             
             if start > now:
-                self.handles["discharge"].append(self.run_at(self.start_discharge, start, discharge_quarter=discharge_quarter))
+                self.handles["discharge"].append(self.run_at(self.start_discharge, start, discharge_quarter=discharge_quarter, unranked=False))
             else:
-                self.start_discharge({"discharge_quarter": discharge_quarter})
+                self.start_discharge({"discharge_quarter": discharge_quarter, "unranked": False})
 
     def start_charge(self, kwargs):
         charge_window = kwargs["charge_window"]
@@ -364,33 +392,37 @@ class SungrowScheduler(hass.Hass):
 
     def start_discharge(self, kwargs):
         discharge_quarter = kwargs["discharge_quarter"]
+        unranked = kwargs["unkranked"]
         
         now = datetime.now(self.tz)
         if now < datetime.fromisoformat(discharge_quarter["start"]) or now >= datetime.fromisoformat(discharge_quarter["end"]):
             return
         
-        now = datetime.now(self.tz)
-        remaining = [q for q in self.discharge_schedule if datetime.fromisoformat(q["end"]) > now]
-        remaining_sorted = sorted(remaining, key=lambda q: q["price"], reverse=True)
-        rank = remaining_sorted.index(discharge_quarter)
-        
-        self.log(
-            f"START DISCHARGE "
-            f"{discharge_quarter['start']} - {discharge_quarter['end']} | "
-            f"Rank: {rank}"
-        )
-        
-        avg_15min_energy = self.get_avg_15min_energy()
-        current_soc = float(self.get_state("sensor.battery_level"))
-        discharge_capacity = ((current_soc - (MIN_SOC * 100)) / 100) * 24320
-        weighted_discharge_capacity = discharge_capacity * 1.15
-        quarters = round(weighted_discharge_capacity / avg_15min_energy)
-        self.log(f"Rank: {rank} Quarters: {quarters}")
-        if rank > quarters:
-            set_stop_discharge(self)
-        else:
+        if unranked:
             set_start_discharge(self)
             self.handles["stop_discharge"].append(self.run_at(self.stop_discharge, datetime.fromisoformat(discharge_quarter["end"])))
+        else:
+            remaining = [q for q in self.discharge_schedule if datetime.fromisoformat(q["end"]) > now]
+            remaining_sorted = sorted(remaining, key=lambda q: q["price"], reverse=True)
+            rank = remaining_sorted.index(discharge_quarter)
+            
+            self.log(
+                f"START DISCHARGE "
+                f"{discharge_quarter['start']} - {discharge_quarter['end']} | "
+                f"Rank: {rank}"
+            )
+            
+            avg_15min_energy = self.get_avg_15min_energy()
+            current_soc = float(self.get_state("sensor.battery_level"))
+            discharge_capacity = ((current_soc - MIN_SOC) / 100) * 24320
+            weighted_discharge_capacity = discharge_capacity * 1.15
+            quarters = round(weighted_discharge_capacity / avg_15min_energy)
+            self.log(f"Rank: {rank} Quarters: {quarters}")
+            if rank > quarters:
+                set_stop_discharge(self)
+            else:
+                set_start_discharge(self)
+                self.handles["stop_discharge"].append(self.run_at(self.stop_discharge, datetime.fromisoformat(discharge_quarter["end"])))
         
         handle = kwargs.get("__handle")
         if handle and handle in self.handles["discharge"]:
@@ -414,6 +446,50 @@ class SungrowScheduler(hass.Hass):
         handle = kwargs.get("__handle")
         if handle and handle in self.handles["stop_discharge"]:
             self.handles["stop_discharge"].remove(handle)
+
+    def set_discharge_after_solar(self, kwargs):
+        current_soc = float(self.get_state("sensor.battery_level"))
+        self.set_state("input_number.latest_charge_soc", state=current_soc)
+        now = datetime.now(self.tz).isoformat()
+
+        if current_soc == 100:
+            self.set_state(
+                "input_text.latest_battery_balance_upper",
+                state=now
+            )
+        
+        for key in ("charge", "discharge"):
+            for h in self.handles.get(key, []):
+                self.cancel_timer(h)
+            self.handles[key].clear()
+        
+        prices = self.get_prices()
+        forecast_start, forecast_end = get_forecast(self)
+
+        if forecast_start is not None:
+            discharge_end_hour = min(forecast_start.hour, 9)
+            discharge_end_minute = (
+                0 if forecast_start.hour > 9 else forecast_start.minute
+            )
+        else:
+            discharge_end_hour = 9
+            discharge_end_minute = 0
+
+        start_index = now.hour * 4 + (2 if now.minute >= 30 else 0)
+        end_index = (
+            24 * 4
+            + discharge_end_hour * 4
+            + (2 if discharge_end_minute == 30 else 0)
+        )
+
+        discharge_quarters_price_sorted = sorted(
+            (
+                p for p in prices[start_index:end_index]
+                if p["price"] >= -200
+            ),
+            key=lambda p: p["price"],
+            reverse=True
+        )
     
     def is_summer(self):
         now = datetime.now(self.tz)
